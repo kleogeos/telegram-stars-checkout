@@ -53,6 +53,13 @@ PRODUCTS = {
     ),
 }
 
+# payload -> stars, must match bot.py's TIPS set
+TIPS = {
+    "tip-100": 100,
+    "tip-300": 300,
+    "tip-1000": 1000,
+}
+
 
 def create_invoice_link(payload, title, description, stars):
     data = json.dumps({
@@ -75,6 +82,17 @@ def main():
         resp = create_invoice_link(payload, title, description, stars)
         if resp.get("ok"):
             results[payload] = {"link": resp["result"], "stars": stars, "title": title}
+            print(f"[ok] {payload} ({stars} stars) -> {resp['result']}")
+        else:
+            print(f"[FAIL] {payload}: {resp}")
+    for payload, stars in TIPS.items():
+        resp = create_invoice_link(
+            payload, f"Tip: {stars} Stars",
+            "Support the free Freelancer Toolbox tools — no download attached.",
+            stars,
+        )
+        if resp.get("ok"):
+            results[payload] = {"link": resp["result"], "stars": stars, "title": f"Tip: {stars} Stars"}
             print(f"[ok] {payload} ({stars} stars) -> {resp['result']}")
         else:
             print(f"[FAIL] {payload}: {resp}")
