@@ -13,8 +13,8 @@ name: Telegram Stars checkout responder
 # tab. Uncomment it as the last step of activation, after TELEGRAM_BOT_TOKEN
 # is set.
 on:
-  # schedule:
-  #   - cron: "0 */6 * * *"
+  schedule:
+    - cron: "0 */6 * * *"
   workflow_dispatch: {}
 
 concurrency:
