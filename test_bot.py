@@ -93,6 +93,29 @@ class TestBotLogic(unittest.TestCase):
         self.assertIn("prompt-pack.zip", params["text"])
         self.assertNotIn("freelancer-kit.zip", params["text"])
 
+    def test_tip_payload_sends_thank_you_without_links(self):
+        fulfilled = {}
+        message = {
+            "chat": {"id": 9},
+            "successful_payment": {
+                "telegram_payment_charge_id": "ch4",
+                "invoice_payload": "tip-300",
+                "total_amount": 300,
+            },
+        }
+        self.bot.handle_successful_payment(message, fulfilled)
+        method, params = self.calls[-1]
+        self.assertEqual(method, "sendMessage")
+        self.assertEqual(params["chat_id"], 9)
+        self.assertNotIn(".zip", params["text"])
+        self.assertIn("ch4", fulfilled)
+
+    def test_tip_payload_is_accepted_at_pre_checkout(self):
+        self.bot.handle_pre_checkout({"id": "pcq3", "invoice_payload": "tip-1000"})
+        method, params = self.calls[-1]
+        self.assertTrue(params["ok"])
+        self.assertNotIn("error_message", params)
+
     def test_unknown_payload_on_successful_payment_does_not_crash_or_send(self):
         fulfilled = {}
         message = {
