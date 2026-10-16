@@ -46,6 +46,7 @@ PRODUCTS = {
         ["files/freelancer-kit.zip", "files/prompt-pack.zip", "files/dev-pack.zip"],
         "Bundle (all three)",
     ),
+    "ru-kit": (["files/ru-crypto-kit.zip"], "RU Crypto Freelancer Kit"),
 }
 
 MAX_RUNTIME_SEC = 5 * 60 * 60 + 50 * 60  # 5h50m, stay under GitHub Actions' 6h job cap
