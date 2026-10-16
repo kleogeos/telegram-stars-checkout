@@ -14,14 +14,16 @@ Telegram requires `answerPreCheckoutQuery` within 10 seconds of every payment at
 
 - `bot.py` — long-polling responder: answers `pre_checkout_query`, and on `successful_payment` sends the buyer their download link. Payloads not in `PRODUCTS` are rejected before any charge happens. Charge IDs are logged so a replayed update never double-delivers.
 - `test_bot.py` — offline unit tests (mocked Telegram API, no network/token needed): `python3 -m unittest test_bot.py`.
-- `.github/workflows/telegram-stars-bot.yml` — the scheduled runner.
+- `.github/workflows/telegram-stars-bot.yml` — the scheduled runner (schedule trigger disabled until activation, see comment in the file).
+- `.github/workflows/test.yml` — runs `test_bot.py` on every push.
+- `create_invoice_links.py` — generates the 4 stable checkout links (live-tested against a throwaway bot token: all 4 `createInvoiceLink` calls succeeded). Star prices use the ~$0.013/star rate Telegram actually credits sellers — verify against the live rate before publishing.
 - `state.json` / `fulfilled.json` — persisted between runs so restarts don't reprocess old updates or double-deliver.
 
 ## To activate
 
-1. Create a **new, dedicated** bot via @BotFather (not the Midas notification bot).
+1. Create a **new, dedicated** bot via @BotFather (not the Midas notification bot) — `createInvoiceLink` is safe to test against any bot, but `bot.py`'s `getUpdates` is NOT: two consumers polling the same bot token steal each other's updates.
 2. Add its token as the `TELEGRAM_BOT_TOKEN` repo secret.
-3. Generate invoice links per product with `createInvoiceLink` (currency `XTR`, payload matching a key in `bot.py`'s `PRODUCTS` dict) and add them as "Pay with Telegram Stars" buttons on the existing checkout pages.
-4. Trigger the workflow once manually (`workflow_dispatch`) to confirm it runs, then let the schedule take over.
+3. Run `TELEGRAM_BOT_TOKEN=... python3 create_invoice_links.py` (with the real dedicated bot's token) to get the 4 real checkout links, then add them as "Pay with Telegram Stars" buttons on the existing checkout pages.
+4. Trigger the workflow once manually (`workflow_dispatch`) to confirm it runs, then uncomment the `schedule` trigger in `telegram-stars-bot.yml`.
 
 Full research and pricing draft: see `TELEGRAM-STARS-RESEARCH.md` in the main workspace.
