@@ -65,6 +65,61 @@ class TestBotLogic(unittest.TestCase):
         self.assertIn("dev-pack.zip", params["text"])
         self.assertIn("ch1", fulfilled)
 
+    def test_successful_payment_notifies_human(self):
+        notified = []
+        fulfilled = {}
+        message = {
+            "chat": {"id": 42},
+            "successful_payment": {
+                "telegram_payment_charge_id": "ch1",
+                "invoice_payload": "bundle",
+                "total_amount": 1390,
+            },
+        }
+        with mock.patch.object(self.bot, "notify_human", side_effect=lambda t: notified.append(t)):
+            self.bot.handle_successful_payment(message, fulfilled)
+        self.assertEqual(len(notified), 1)
+        self.assertIn("Sale!", notified[0])
+        self.assertIn("1390", notified[0])
+
+    def test_tip_notifies_human(self):
+        notified = []
+        fulfilled = {}
+        message = {
+            "chat": {"id": 9},
+            "successful_payment": {
+                "telegram_payment_charge_id": "ch4",
+                "invoice_payload": "tip-300",
+                "total_amount": 300,
+            },
+        }
+        with mock.patch.object(self.bot, "notify_human", side_effect=lambda t: notified.append(t)):
+            self.bot.handle_successful_payment(message, fulfilled)
+        self.assertEqual(len(notified), 1)
+        self.assertIn("Tip!", notified[0])
+
+    def test_duplicate_charge_id_does_not_renotify(self):
+        notified = []
+        fulfilled = {"ch1": {"product": "Bundle (all three)", "stars": 1390}}
+        message = {
+            "chat": {"id": 42},
+            "successful_payment": {
+                "telegram_payment_charge_id": "ch1",
+                "invoice_payload": "bundle",
+                "total_amount": 1390,
+            },
+        }
+        with mock.patch.object(self.bot, "notify_human", side_effect=lambda t: notified.append(t)):
+            self.bot.handle_successful_payment(message, fulfilled)
+        self.assertEqual(notified, [])
+
+    def test_notify_human_is_a_noop_without_secrets(self):
+        os.environ.pop("TELEGRAM_NOTIFY_TOKEN", None)
+        os.environ.pop("TELEGRAM_NOTIFY_CHAT_ID", None)
+        with mock.patch("urllib.request.urlopen") as m:
+            self.bot.notify_human("should not send")
+        m.assert_not_called()
+
     def test_duplicate_charge_id_is_not_delivered_twice(self):
         fulfilled = {"ch1": {"product": "Bundle (all three)", "stars": 1390}}
         message = {
@@ -187,3 +242,4 @@ class TestApiCallRetry(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
