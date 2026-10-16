@@ -28,6 +28,7 @@ import json
 import os
 import sys
 import time
+import urllib.error
 import urllib.request
 import urllib.parse
 
@@ -56,12 +57,27 @@ MAX_RUNTIME_SEC = 5 * 60 * 60 + 50 * 60  # 5h50m, stay under GitHub Actions' 6h 
 
 
 def api_call(method, **params):
+    # GitHub-hosted runners occasionally hit a transient "Network is
+    # unreachable" blip (seen 3 times in one day: 2026-10-16). Without a
+    # retry, that single blip used to kill the whole long-poll process,
+    # leaving the bot unable to answer checkouts until the next 6h cron
+    # slot — a real lost sale, not just a delay, since pre-checkout queries
+    # must be answered within 10s. A few quick retries absorb the blip
+    # without materially eating into that 10s budget.
     data = json.dumps(params).encode()
     req = urllib.request.Request(
         f"{API}/{method}", data=data, headers={"Content-Type": "application/json"}
     )
-    with urllib.request.urlopen(req, timeout=40) as r:
-        return json.load(r)
+    last_err = None
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(req, timeout=40) as r:
+                return json.load(r)
+        except (urllib.error.URLError, TimeoutError) as e:
+            last_err = e
+            if attempt < 2:
+                time.sleep(1 + attempt)
+    raise last_err
 
 
 def load_json(path, default):
@@ -130,15 +146,23 @@ def main():
     deadline = time.time() + MAX_RUNTIME_SEC
 
     while time.time() < deadline:
-        resp = api_call("getUpdates", offset=state["offset"], timeout=30,
-                         allowed_updates=["pre_checkout_query", "message"])
-        for update in resp.get("result", []):
-            state["offset"] = update["update_id"] + 1
-            if "pre_checkout_query" in update:
-                handle_pre_checkout(update["pre_checkout_query"])
-            elif "message" in update and "successful_payment" in update["message"]:
-                handle_successful_payment(update["message"], fulfilled)
-        save_json(STATE_PATH, state)
+        try:
+            resp = api_call("getUpdates", offset=state["offset"], timeout=30,
+                             allowed_updates=["pre_checkout_query", "message"])
+            for update in resp.get("result", []):
+                state["offset"] = update["update_id"] + 1
+                if "pre_checkout_query" in update:
+                    handle_pre_checkout(update["pre_checkout_query"])
+                elif "message" in update and "successful_payment" in update["message"]:
+                    handle_successful_payment(update["message"], fulfilled)
+            save_json(STATE_PATH, state)
+        except (urllib.error.URLError, TimeoutError) as e:
+            # Retries inside api_call already absorbed short blips; if we still
+            # land here the network is down for longer. Sleep and keep polling
+            # within this same job instead of exiting and waiting hours for
+            # the next cron slot.
+            print(f"[WARN] getUpdates failed, backing off 30s: {e}")
+            time.sleep(30)
 
     print("Runtime budget reached, exiting cleanly for the next scheduled run.")
 
