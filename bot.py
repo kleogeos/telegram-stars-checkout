@@ -23,6 +23,12 @@ State: last processed update_id is persisted to state.json and committed
 back so a restart doesn't reprocess old updates. Fulfilled payments are
 logged to fulfilled.json (charge_id -> product) so a replayed update never
 double-delivers.
+
+Optional repo secrets TELEGRAM_NOTIFY_TOKEN/TELEGRAM_NOTIFY_CHAT_ID (the
+Midas human-notification bot — sendMessage only, no getUpdates polling, so
+reusing that token here does not steal its updates) push a message to the
+human on every real sale/tip. Without this, a sale is only visible to the
+buyer themselves — nobody running this project would know it happened.
 """
 import json
 import os
@@ -80,9 +86,23 @@ def api_call(method, **params):
     raise last_err
 
 
+def notify_human(text):
+    token = os.environ.get("TELEGRAM_NOTIFY_TOKEN")
+    chat_id = os.environ.get("TELEGRAM_NOTIFY_CHAT_ID")
+    if not token or not chat_id:
+        return
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    data = urllib.parse.urlencode({"chat_id": chat_id, "text": text}).encode()
+    try:
+        urllib.request.urlopen(urllib.request.Request(url, data=data), timeout=15)
+    except Exception as e:  # noqa: BLE001 — a notify failure must never break fulfillment
+        print(f"[warn] telegram notify failed: {e}")
+
+
 def load_json(path, default):
     if os.path.exists(path):
-        return json.load(open(path))
+        with open(path) as f:
+            return json.load(f)
     return default
 
 
@@ -119,6 +139,7 @@ def handle_successful_payment(message, fulfilled):
         fulfilled[charge_id] = {"product": payload, "stars": sp["total_amount"]}
         save_json(FULFILLED_PATH, fulfilled)
         print(f"[fulfilled] tip -> chat {chat_id} (charge {charge_id[:12]}...)")
+        notify_human(f"Tip! {sp['total_amount']} Stars (charge {charge_id[:12]}...)")
         return
     paths, name = PRODUCTS.get(payload, (None, None))
     if not paths:
@@ -133,6 +154,7 @@ def handle_successful_payment(message, fulfilled):
     fulfilled[charge_id] = {"product": name, "stars": sp["total_amount"]}
     save_json(FULFILLED_PATH, fulfilled)
     print(f"[fulfilled] {name} -> chat {chat_id} (charge {charge_id[:12]}...)")
+    notify_human(f"Sale! {name} ({sp['total_amount']} Stars, charge {charge_id[:12]}...)")
 
 
 def main():
@@ -169,3 +191,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
