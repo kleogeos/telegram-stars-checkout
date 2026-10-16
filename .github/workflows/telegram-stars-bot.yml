@@ -6,9 +6,15 @@ name: Telegram Stars checkout responder
 # of gap. Needs a DEDICATED bot token (TELEGRAM_BOT_TOKEN secret) — never
 # the Midas human-notification bot, since two consumers polling the same
 # bot's getUpdates would steal each other's updates.
+#
+# The `schedule` trigger is intentionally commented out until the secret
+# exists: cron would otherwise fire every 6h forever and fail every time
+# (no token yet), leaving this public repo with a permanently red Actions
+# tab. Uncomment it as the last step of activation, after TELEGRAM_BOT_TOKEN
+# is set.
 on:
-  schedule:
-    - cron: "0 */6 * * *"
+  # schedule:
+  #   - cron: "0 */6 * * *"
   workflow_dispatch: {}
 
 concurrency:
