@@ -1,0 +1,36 @@
+name: Telegram Stars checkout responder
+
+# Public-repo Actions minutes are unlimited, so this gives near-continuous
+# coverage for $0: each run long-polls for ~5h50m (under the 6h job cap),
+# and cron re-triggers the next run right after, leaving only a few seconds
+# of gap. Needs a DEDICATED bot token (TELEGRAM_BOT_TOKEN secret) — never
+# the Midas human-notification bot, since two consumers polling the same
+# bot's getUpdates would steal each other's updates.
+on:
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch: {}
+
+concurrency:
+  group: telegram-stars-bot
+  cancel-in-progress: false
+
+jobs:
+  respond:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run responder
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        run: python3 bot.py
+
+      - name: Commit updated state
+        run: |
+          git config user.name "telegram-stars-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add state.json fulfilled.json
+          git diff --cached --quiet || git commit -m "Update bot state [skip ci]"
+          git push
