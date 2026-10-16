@@ -6,6 +6,7 @@ import os
 import sys
 import tempfile
 import unittest
+import urllib.error
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -130,6 +131,58 @@ class TestBotLogic(unittest.TestCase):
         self.bot.handle_successful_payment(message, fulfilled)
         self.assertEqual(len(self.calls), n_calls_before)
         self.assertNotIn("ch3", fulfilled)
+
+
+class TestApiCallRetry(unittest.TestCase):
+    def setUp(self):
+        os.environ["TELEGRAM_BOT_TOKEN"] = "test-token"
+        import bot
+        self.bot = bot
+
+    def test_transient_network_error_is_retried_and_succeeds(self):
+        calls = {"n": 0}
+
+        def flaky_urlopen(req, timeout=40):
+            calls["n"] += 1
+            if calls["n"] < 3:
+                raise urllib.error.URLError("Network is unreachable")
+            return mock.mock_open(read_data=b'{"ok": true}')()
+
+        with mock.patch("urllib.request.urlopen", side_effect=flaky_urlopen), \
+             mock.patch("time.sleep"), \
+             mock.patch("json.load", return_value={"ok": True}):
+            result = self.bot.api_call("getUpdates", offset=0)
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(calls["n"], 3)
+
+    def test_persistent_network_error_raises_after_retries(self):
+        def always_fails(req, timeout=40):
+            raise urllib.error.URLError("Network is unreachable")
+
+        with mock.patch("urllib.request.urlopen", side_effect=always_fails), \
+             mock.patch("time.sleep"):
+            with self.assertRaises(urllib.error.URLError):
+                self.bot.api_call("getUpdates", offset=0)
+
+    def test_main_loop_backs_off_on_network_error_instead_of_crashing(self):
+        self.bot.STATE_PATH = tempfile.mktemp()
+        self.bot.FULFILLED_PATH = tempfile.mktemp()
+        calls = {"n": 0}
+
+        def fake_api_call(method, **params):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise urllib.error.URLError("Network is unreachable")
+            return {"ok": True, "result": []}
+
+        # deadline = first value (0) + MAX_RUNTIME_SEC; loop re-checks time.time()
+        # on every iteration, so give exactly enough values to run twice then stop.
+        with mock.patch.object(self.bot, "api_call", fake_api_call), \
+             mock.patch.object(self.bot, "MAX_RUNTIME_SEC", 1), \
+             mock.patch("time.sleep"), \
+             mock.patch("time.time", side_effect=[0, 0, 0.5, 2]):
+            self.bot.main()
+        self.assertEqual(calls["n"], 2)
 
 
 if __name__ == "__main__":
