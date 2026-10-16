@@ -45,6 +45,12 @@ PRODUCTS = {
         "All three kits together.",
         1920,
     ),
+    "ru-kit": (
+        "RU Crypto Freelancer Kit",
+        "Invoice template, payment reminders, self-employment/115-FZ checklist, "
+        "crypto income log — for RU/CIS freelancers billing foreign clients.",
+        530,
+    ),
 }
 
 
