@@ -49,6 +49,9 @@ PRODUCTS = {
     "ru-kit": (["files/ru-crypto-kit.zip"], "RU Crypto Freelancer Kit"),
 }
 
+# Tip-jar payloads (donate.html) — no file to deliver, just a thank-you.
+TIPS = {"tip-100", "tip-300", "tip-1000"}
+
 MAX_RUNTIME_SEC = 5 * 60 * 60 + 50 * 60  # 5h50m, stay under GitHub Actions' 6h job cap
 
 
@@ -76,7 +79,7 @@ def handle_pre_checkout(pcq):
     # Must answer within 10s. payload must be a known product, otherwise reject
     # so no one can be charged for a typo'd/unknown payload.
     payload = pcq.get("invoice_payload", "")
-    ok = payload in PRODUCTS
+    ok = payload in PRODUCTS or payload in TIPS
     kwargs = {"pre_checkout_query_id": pcq["id"], "ok": ok}
     if not ok:
         kwargs["error_message"] = "Unknown product, please use the link from the website."
@@ -91,6 +94,16 @@ def handle_successful_payment(message, fulfilled):
     chat_id = message["chat"]["id"]
     if charge_id in fulfilled:
         return  # already delivered, never double-send
+    if payload in TIPS:
+        api_call(
+            "sendMessage",
+            chat_id=chat_id,
+            text="Thank you for the tip! It genuinely helps keep the free tools maintained.",
+        )
+        fulfilled[charge_id] = {"product": payload, "stars": sp["total_amount"]}
+        save_json(FULFILLED_PATH, fulfilled)
+        print(f"[fulfilled] tip -> chat {chat_id} (charge {charge_id[:12]}...)")
+        return
     paths, name = PRODUCTS.get(payload, (None, None))
     if not paths:
         print(f"[WARN] successful_payment with unknown payload={payload!r} charge_id={charge_id}")
