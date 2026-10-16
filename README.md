@@ -1,5 +1,7 @@
 # telegram-stars-checkout
 
+![Test](https://github.com/kleogeos/telegram-stars-checkout/actions/workflows/test.yml/badge.svg)
+
 Fulfillment responder for selling digital goods via [Telegram Stars](https://core.telegram.org/bots/payments-stars) (currency `XTR`) — no bank, no card network, no Stripe/PayPal, no KYC on the selling side.
 
 **Status: code complete and tested, not yet activated.** Needs a dedicated bot token (see below) — do not reuse a bot that's already polled by something else.
