@@ -1,0 +1,127 @@
+#!/usr/bin/env python3
+"""Long-polling responder for Telegram Stars (XTR) digital-goods checkout.
+
+Why this exists: Telegram requires answerPreCheckoutQuery within 10 seconds
+of every payment attempt, for any currency including XTR (Stars). There is
+no "auto-approve" default. Without a process answering that query, the buyer
+sees BOT_PRECHECKOUT_TIMEOUT and the payment fails.
+
+Why GitHub Actions: this script is designed to run inside a scheduled
+GitHub Actions job (see ../.github/workflows/telegram-stars-bot.yml in the
+dedicated repo this gets pushed to). Actions minutes are unlimited for
+public repos, so a job that long-polls for ~5h50m and gets re-triggered by
+cron before it's killed gives near-continuous coverage for $0 and no new
+hosting account. Not literally 24/7 (a few seconds of restart gap between
+runs), but far better than nothing, and good enough for a low-volume
+digital-goods checkout.
+
+Requires a DEDICATED bot token (not the Midas human-notification bot) —
+polling getUpdates on a token already being read by another consumer would
+steal that consumer's updates. Set TELEGRAM_BOT_TOKEN as a repo secret.
+
+State: last processed update_id is persisted to state.json and committed
+back so a restart doesn't reprocess old updates. Fulfilled payments are
+logged to fulfilled.json (charge_id -> product) so a replayed update never
+double-delivers.
+"""
+import json
+import os
+import time
+import urllib.request
+import urllib.parse
+
+TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+API = f"https://api.telegram.org/bot{TOKEN}"
+BASE_URL = "https://kleogeos.github.io/freelancer-tools"
+STATE_PATH = os.path.join(os.path.dirname(__file__), "state.json")
+FULFILLED_PATH = os.path.join(os.path.dirname(__file__), "fulfilled.json")
+
+# invoice_payload -> (download path(s), display name)
+PRODUCTS = {
+    "starter-kit": (["files/freelancer-kit.zip"], "Freelancer Starter Kit"),
+    "prompt-pack": (["files/prompt-pack.zip"], "40 AI Prompts for Freelancers"),
+    "dev-pack": (["files/dev-pack.zip"], "Web Developer Pack"),
+    "bundle": (
+        ["files/freelancer-kit.zip", "files/prompt-pack.zip", "files/dev-pack.zip"],
+        "Bundle (all three)",
+    ),
+}
+
+MAX_RUNTIME_SEC = 5 * 60 * 60 + 50 * 60  # 5h50m, stay under GitHub Actions' 6h job cap
+
+
+def api_call(method, **params):
+    data = json.dumps(params).encode()
+    req = urllib.request.Request(
+        f"{API}/{method}", data=data, headers={"Content-Type": "application/json"}
+    )
+    with urllib.request.urlopen(req, timeout=40) as r:
+        return json.load(r)
+
+
+def load_json(path, default):
+    if os.path.exists(path):
+        return json.load(open(path))
+    return default
+
+
+def save_json(path, obj):
+    with open(path, "w") as f:
+        json.dump(obj, f, indent=2)
+
+
+def handle_pre_checkout(pcq):
+    # Must answer within 10s. payload must be a known product, otherwise reject
+    # so no one can be charged for a typo'd/unknown payload.
+    payload = pcq.get("invoice_payload", "")
+    ok = payload in PRODUCTS
+    kwargs = {"pre_checkout_query_id": pcq["id"], "ok": ok}
+    if not ok:
+        kwargs["error_message"] = "Unknown product, please use the link from the website."
+    api_call("answerPreCheckoutQuery", **kwargs)
+    print(f"[pre_checkout] payload={payload!r} ok={ok}")
+
+
+def handle_successful_payment(message, fulfilled):
+    sp = message["successful_payment"]
+    charge_id = sp["telegram_payment_charge_id"]
+    payload = sp.get("invoice_payload", "")
+    chat_id = message["chat"]["id"]
+    if charge_id in fulfilled:
+        return  # already delivered, never double-send
+    paths, name = PRODUCTS.get(payload, (None, None))
+    if not paths:
+        print(f"[WARN] successful_payment with unknown payload={payload!r} charge_id={charge_id}")
+        return
+    links = "\n".join(f"{BASE_URL}/{p}" for p in paths)
+    api_call(
+        "sendMessage",
+        chat_id=chat_id,
+        text=f"Thanks for your order! Here's your download:\n\n{links}\n\nEnjoy!",
+    )
+    fulfilled[charge_id] = {"product": name, "stars": sp["total_amount"]}
+    save_json(FULFILLED_PATH, fulfilled)
+    print(f"[fulfilled] {name} -> chat {chat_id} (charge {charge_id[:12]}...)")
+
+
+def main():
+    state = load_json(STATE_PATH, {"offset": 0})
+    fulfilled = load_json(FULFILLED_PATH, {})
+    deadline = time.time() + MAX_RUNTIME_SEC
+
+    while time.time() < deadline:
+        resp = api_call("getUpdates", offset=state["offset"], timeout=30,
+                         allowed_updates=["pre_checkout_query", "message"])
+        for update in resp.get("result", []):
+            state["offset"] = update["update_id"] + 1
+            if "pre_checkout_query" in update:
+                handle_pre_checkout(update["pre_checkout_query"])
+            elif "message" in update and "successful_payment" in update["message"]:
+                handle_successful_payment(update["message"], fulfilled)
+        save_json(STATE_PATH, state)
+
+    print("Runtime budget reached, exiting cleanly for the next scheduled run.")
+
+
+if __name__ == "__main__":
+    main()
