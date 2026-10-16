@@ -26,11 +26,12 @@ double-delivers.
 """
 import json
 import os
+import sys
 import time
 import urllib.request
 import urllib.parse
 
-TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 API = f"https://api.telegram.org/bot{TOKEN}"
 BASE_URL = "https://kleogeos.github.io/freelancer-tools"
 STATE_PATH = os.path.join(os.path.dirname(__file__), "state.json")
@@ -105,6 +106,11 @@ def handle_successful_payment(message, fulfilled):
 
 
 def main():
+    if not TOKEN:
+        sys.exit(
+            "TELEGRAM_BOT_TOKEN is not set — this is expected until activation. "
+            "See README.md 'To activate'. Not treating this as a crash."
+        )
     state = load_json(STATE_PATH, {"offset": 0})
     fulfilled = load_json(FULFILLED_PATH, {})
     deadline = time.time() + MAX_RUNTIME_SEC
