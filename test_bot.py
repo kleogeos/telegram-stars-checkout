@@ -187,6 +187,28 @@ class TestBotLogic(unittest.TestCase):
         self.assertEqual(len(self.calls), n_calls_before)
         self.assertNotIn("ch3", fulfilled)
 
+    def test_unknown_payload_on_successful_payment_pages_human(self):
+        # The buyer was already charged by Telegram by this point (payload
+        # mismatches only happen if PRODUCTS changed after an invoice link was
+        # minted/shared) — silently dropping this would mean a paid buyer gets
+        # nothing and nobody ever finds out. Must notify, unlike a normal
+        # pre_checkout rejection which happens before any money moves.
+        notified = []
+        fulfilled = {}
+        message = {
+            "chat": {"id": 7},
+            "successful_payment": {
+                "telegram_payment_charge_id": "ch3",
+                "invoice_payload": "nonexistent",
+                "total_amount": 100,
+            },
+        }
+        with mock.patch.object(self.bot, "notify_human", side_effect=lambda t: notified.append(t)):
+            self.bot.handle_successful_payment(message, fulfilled)
+        self.assertEqual(len(notified), 1)
+        self.assertIn("URGENT", notified[0])
+        self.assertIn("100", notified[0])
+
 
 class TestApiCallRetry(unittest.TestCase):
     def setUp(self):
