@@ -143,7 +143,20 @@ def handle_successful_payment(message, fulfilled):
         return
     paths, name = PRODUCTS.get(payload, (None, None))
     if not paths:
+        # The buyer has already been charged Stars by Telegram at this point —
+        # pre_checkout only blocks the charge for unknown payloads, it can't
+        # stop PRODUCTS changing between invoice-link creation and payment
+        # (e.g. a product removed/renamed after an old link was already
+        # shared). Silently returning here used to mean: buyer paid, nobody
+        # delivered anything, and nobody was ever told — the one outcome
+        # worth paging a human for immediately, so notify_human instead of
+        # just logging to a workflow log nobody reads in time.
         print(f"[WARN] successful_payment with unknown payload={payload!r} charge_id={charge_id}")
+        notify_human(
+            f"URGENT: charged {sp['total_amount']} Stars for unknown payload "
+            f"{payload!r} (charge {charge_id[:12]}...) — buyer paid, nothing "
+            f"delivered, needs manual refund or fulfillment."
+        )
         return
     links = "\n".join(f"{BASE_URL}/{p}" for p in paths)
     api_call(
