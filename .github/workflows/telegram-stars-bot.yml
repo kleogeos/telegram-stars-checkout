@@ -7,11 +7,11 @@ name: Telegram Stars checkout responder
 # the Midas human-notification bot, since two consumers polling the same
 # bot's getUpdates would steal each other's updates.
 #
-# The `schedule` trigger is intentionally commented out until the secret
-# exists: cron would otherwise fire every 6h forever and fail every time
-# (no token yet), leaving this public repo with a permanently red Actions
-# tab. Uncomment it as the last step of activation, after TELEGRAM_BOT_TOKEN
-# is set.
+# The `schedule` trigger below is ACTIVE: TELEGRAM_BOT_TOKEN was set and
+# this has been running since 17.10. Each run's ~5h50m long-poll plus the
+# serializing concurrency group means a new cron tick just queues behind
+# the still-running job and starts right after it finishes — that queue
+# wait (up to ~6h) is expected, not a stuck run.
 on:
   schedule:
     - cron: "0 */6 * * *"
