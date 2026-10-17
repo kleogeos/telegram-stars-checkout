@@ -40,5 +40,31 @@ jobs:
           git config user.name "telegram-stars-bot"
           git config user.email "actions@users.noreply.github.com"
           git add state.json fulfilled.json
-          git diff --cached --quiet || git commit -m "Update bot state [skip ci]"
-          git push
+          if git diff --cached --quiet; then
+            echo "Nothing to commit."
+            exit 0
+          fi
+          git commit -m "Update bot state [skip ci]"
+          # A plain git push used to fail silently with 'fetch first' whenever
+          # main moved during this job's ~5h50m long-poll (e.g. a direct code
+          # push elsewhere in the same window) - the commit step would fail
+          # but the job itself reported no error visible without checking
+          # Actions, and the whole run's offset/fulfilled-dedup advance was
+          # discarded, risking a re-processed update and a duplicate "Sale!"
+          # notify + duplicate download message on the next run. Retry with
+          # rebase onto the latest main instead of giving up after one push.
+          for i in 1 2 3 4 5; do
+            if git push; then
+              exit 0
+            fi
+            echo "push rejected (attempt ), rebasing onto latest origin/main"
+            git fetch origin main
+            if ! git rebase origin/main; then
+              git rebase --abort
+              echo "::error::rebase conflict on state.json/fulfilled.json, giving up"
+              exit 1
+            fi
+            sleep 3
+          done
+          echo "::error::failed to push bot state after 5 attempts"
+          exit 1
