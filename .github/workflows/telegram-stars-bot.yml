@@ -57,7 +57,7 @@ jobs:
             if git push; then
               exit 0
             fi
-            echo "push rejected (attempt ), rebasing onto latest origin/main"
+            echo "push rejected (attempt $i), rebasing onto latest origin/main"
             git fetch origin main
             if ! git rebase origin/main; then
               git rebase --abort
