@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Offline tests for bot.py's decision logic. Mocks api_call so no network/token
 is needed and the real bot (used for human notifications) is never touched."""
+import http.client
 import json
 import os
 import sys
@@ -242,6 +243,29 @@ class TestApiCallRetry(unittest.TestCase):
             with self.assertRaises(urllib.error.URLError):
                 self.bot.api_call("getUpdates", offset=0)
 
+    def test_remote_disconnected_is_retried_and_succeeds(self):
+        # Live incident 2026-10-20T18:18 run: getUpdates raised
+        # http.client.RemoteDisconnected, which escaped this retry loop
+        # uncaught (only urllib.error.URLError/TimeoutError were caught) and
+        # killed the whole 5h50m long-poll process, leaving the bot unable
+        # to answer pre_checkout_query until the next cron slot picked it up.
+        calls = {"n": 0}
+
+        def flaky_urlopen(req, timeout=40):
+            calls["n"] += 1
+            if calls["n"] < 3:
+                raise http.client.RemoteDisconnected(
+                    "Remote end closed connection without response"
+                )
+            return mock.mock_open(read_data=b'{"ok": true}')()
+
+        with mock.patch("urllib.request.urlopen", side_effect=flaky_urlopen), \
+             mock.patch("time.sleep"), \
+             mock.patch("json.load", return_value={"ok": True}):
+            result = self.bot.api_call("getUpdates", offset=0)
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(calls["n"], 3)
+
     def test_main_loop_backs_off_on_network_error_instead_of_crashing(self):
         self.bot.STATE_PATH = tempfile.mktemp()
         self.bot.FULFILLED_PATH = tempfile.mktemp()
@@ -258,6 +282,30 @@ class TestApiCallRetry(unittest.TestCase):
         # the deadline is even computed; deadline = second value + MAX_RUNTIME_SEC;
         # loop re-checks time.time() on every iteration, so give exactly enough
         # values to run twice then stop.
+        with mock.patch.object(self.bot, "api_call", fake_api_call), \
+             mock.patch.object(self.bot, "MAX_RUNTIME_SEC", 1), \
+             mock.patch("time.sleep"), \
+             mock.patch("time.time", side_effect=[0, 0, 0, 0.5, 2]):
+            self.bot.main()
+        self.assertEqual(calls["n"], 2)
+
+    def test_main_loop_backs_off_on_remote_disconnected_instead_of_crashing(self):
+        # Same scenario as the URLError test above, but for the exception
+        # type that actually crashed the live 2026-10-20T18:18 run uncaught
+        # (http.client.RemoteDisconnected is not a urllib.error.URLError).
+        self.bot.STATE_PATH = tempfile.mktemp()
+        self.bot.FULFILLED_PATH = tempfile.mktemp()
+        self.bot.PENDING_PATH = tempfile.mktemp()
+        calls = {"n": 0}
+
+        def fake_api_call(method, **params):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise http.client.RemoteDisconnected(
+                    "Remote end closed connection without response"
+                )
+            return {"ok": True, "result": []}
+
         with mock.patch.object(self.bot, "api_call", fake_api_call), \
              mock.patch.object(self.bot, "MAX_RUNTIME_SEC", 1), \
              mock.patch("time.sleep"), \
