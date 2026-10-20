@@ -5,6 +5,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import unittest
 import urllib.error
 from unittest import mock
@@ -33,7 +34,7 @@ class TestBotLogic(unittest.TestCase):
         self.patcher.stop()
 
     def test_known_payload_is_accepted(self):
-        self.bot.handle_pre_checkout({"id": "pcq1", "invoice_payload": "starter-kit"})
+        self.bot.handle_pre_checkout({"id": "pcq1", "invoice_payload": "starter-kit"}, {})
         method, params = self.calls[-1]
         self.assertEqual(method, "answerPreCheckoutQuery")
         self.assertEqual(params["pre_checkout_query_id"], "pcq1")
@@ -41,7 +42,7 @@ class TestBotLogic(unittest.TestCase):
         self.assertNotIn("error_message", params)
 
     def test_unknown_payload_is_rejected(self):
-        self.bot.handle_pre_checkout({"id": "pcq2", "invoice_payload": "typo-product"})
+        self.bot.handle_pre_checkout({"id": "pcq2", "invoice_payload": "typo-product"}, {})
         method, params = self.calls[-1]
         self.assertFalse(params["ok"])
         self.assertIn("error_message", params)
@@ -167,7 +168,7 @@ class TestBotLogic(unittest.TestCase):
         self.assertIn("ch4", fulfilled)
 
     def test_tip_payload_is_accepted_at_pre_checkout(self):
-        self.bot.handle_pre_checkout({"id": "pcq3", "invoice_payload": "tip-1000"})
+        self.bot.handle_pre_checkout({"id": "pcq3", "invoice_payload": "tip-1000"}, {})
         method, params = self.calls[-1]
         self.assertTrue(params["ok"])
         self.assertNotIn("error_message", params)
@@ -244,6 +245,7 @@ class TestApiCallRetry(unittest.TestCase):
     def test_main_loop_backs_off_on_network_error_instead_of_crashing(self):
         self.bot.STATE_PATH = tempfile.mktemp()
         self.bot.FULFILLED_PATH = tempfile.mktemp()
+        self.bot.PENDING_PATH = tempfile.mktemp()
         calls = {"n": 0}
 
         def fake_api_call(method, **params):
@@ -252,14 +254,156 @@ class TestApiCallRetry(unittest.TestCase):
                 raise urllib.error.URLError("Network is unreachable")
             return {"ok": True, "result": []}
 
-        # deadline = first value (0) + MAX_RUNTIME_SEC; loop re-checks time.time()
-        # on every iteration, so give exactly enough values to run twice then stop.
+        # First value is consumed by prune_pending()'s time.time() call before
+        # the deadline is even computed; deadline = second value + MAX_RUNTIME_SEC;
+        # loop re-checks time.time() on every iteration, so give exactly enough
+        # values to run twice then stop.
         with mock.patch.object(self.bot, "api_call", fake_api_call), \
              mock.patch.object(self.bot, "MAX_RUNTIME_SEC", 1), \
              mock.patch("time.sleep"), \
-             mock.patch("time.time", side_effect=[0, 0, 0.5, 2]):
+             mock.patch("time.time", side_effect=[0, 0, 0, 0.5, 2]):
             self.bot.main()
         self.assertEqual(calls["n"], 2)
+
+
+class TestCustomInvoiceFlow(unittest.TestCase):
+    """End-to-end for the new paid custom-invoice flow: a plain-text /invoice
+    message -> a pending order + pay link -> pre_checkout accepted only while
+    the order is pending -> successful_payment renders and sends the file."""
+
+    GOOD_TEXT = (
+        "/invoice\n"
+        "from: Jane Doe\n"
+        "to: Acme Corp\n"
+        "item: Website redesign | 10 | 50"
+    )
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        os.environ["TELEGRAM_BOT_TOKEN"] = "test-token"
+        import bot
+        self.bot = bot
+        self.bot.STATE_PATH = os.path.join(self.tmpdir, "state.json")
+        self.bot.FULFILLED_PATH = os.path.join(self.tmpdir, "fulfilled.json")
+        self.bot.PENDING_PATH = os.path.join(self.tmpdir, "pending_orders.json")
+        self.calls = []
+
+        def fake_api_call(method, **params):
+            self.calls.append((method, params))
+            if method == "createInvoiceLink":
+                return {"ok": True, "result": "https://t.me/invoice/fakehash"}
+            return {"ok": True, "result": True}
+
+        self.api_patcher = mock.patch.object(self.bot, "api_call", fake_api_call)
+        self.api_patcher.start()
+        self.docs_sent = []
+        self.docs_patcher = mock.patch.object(
+            self.bot, "send_document",
+            side_effect=lambda chat_id, filename, content_bytes, caption=None:
+                self.docs_sent.append((chat_id, filename, content_bytes, caption)),
+        )
+        self.docs_patcher.start()
+
+    def tearDown(self):
+        self.api_patcher.stop()
+        self.docs_patcher.stop()
+
+    def test_valid_invoice_message_creates_pending_order_and_pay_link(self):
+        pending = {}
+        self.bot.handle_message({"chat": {"id": 11}, "text": self.GOOD_TEXT}, pending)
+        self.assertEqual(len(pending), 1)
+        order_id = next(iter(pending))
+        self.assertEqual(pending[order_id]["chat_id"], 11)
+        method, params = self.calls[-1]
+        self.assertEqual(method, "sendMessage")
+        self.assertIn("fakehash", params["text"])
+
+    def test_invalid_invoice_message_sends_error_not_pending_order(self):
+        pending = {}
+        self.bot.handle_message({"chat": {"id": 11}, "text": "/invoice\nfrom: Jane"}, pending)
+        self.assertEqual(pending, {})
+        method, params = self.calls[-1]
+        self.assertEqual(method, "sendMessage")
+        self.assertIn("item", params["text"].lower())
+
+    def test_bare_invoice_command_sends_usage(self):
+        pending = {}
+        self.bot.handle_message({"chat": {"id": 11}, "text": "/invoice"}, pending)
+        self.assertEqual(pending, {})
+        method, params = self.calls[-1]
+        self.assertIn("item", params["text"])
+
+    def test_unrelated_message_is_ignored(self):
+        pending = {}
+        self.bot.handle_message({"chat": {"id": 11}, "text": "hello there"}, pending)
+        self.assertEqual(pending, {})
+        self.assertEqual(self.calls, [])
+
+    def test_message_without_text_is_ignored(self):
+        pending = {}
+        self.bot.handle_message({"chat": {"id": 11}, "sticker": {}}, pending)
+        self.assertEqual(self.calls, [])
+
+    def test_pre_checkout_accepted_only_while_order_pending(self):
+        pending = {"abcd1234": {"chat_id": 11, "data": {}, "ts": time.time()}}
+        self.bot.handle_pre_checkout({"id": "pcq1", "invoice_payload": "custom-invoice:abcd1234"}, pending)
+        method, params = self.calls[-1]
+        self.assertTrue(params["ok"])
+
+    def test_pre_checkout_rejected_for_unknown_order_id(self):
+        pending = {}
+        self.bot.handle_pre_checkout({"id": "pcq1", "invoice_payload": "custom-invoice:ghost"}, pending)
+        method, params = self.calls[-1]
+        self.assertFalse(params["ok"])
+
+    def test_full_flow_message_to_delivered_file(self):
+        pending = {}
+        self.bot.handle_message({"chat": {"id": 11}, "text": self.GOOD_TEXT}, pending)
+        order_id = next(iter(pending))
+        fulfilled = {}
+        message = {
+            "chat": {"id": 11},
+            "successful_payment": {
+                "telegram_payment_charge_id": "chX",
+                "invoice_payload": f"custom-invoice:{order_id}",
+                "total_amount": 100,
+            },
+        }
+        self.bot.handle_successful_payment(message, fulfilled, pending)
+        self.assertEqual(pending, {})  # consumed
+        self.assertIn("chX", fulfilled)
+        self.assertEqual(len(self.docs_sent), 1)
+        chat_id, filename, content_bytes, caption = self.docs_sent[0]
+        self.assertEqual(chat_id, 11)
+        self.assertIn(b"Jane Doe", content_bytes)
+        self.assertIn(b"$500.00", content_bytes)  # 10 * 50
+
+    def test_payment_for_missing_pending_order_notifies_human_not_crash(self):
+        notified = []
+        fulfilled = {}
+        message = {
+            "chat": {"id": 11},
+            "successful_payment": {
+                "telegram_payment_charge_id": "chY",
+                "invoice_payload": "custom-invoice:ghost",
+                "total_amount": 100,
+            },
+        }
+        with mock.patch.object(self.bot, "notify_human", side_effect=lambda t: notified.append(t)):
+            self.bot.handle_successful_payment(message, fulfilled, {})
+        self.assertEqual(len(notified), 1)
+        self.assertIn("URGENT", notified[0])
+        self.assertEqual(self.docs_sent, [])
+        self.assertNotIn("chY", fulfilled)
+
+    def test_prune_pending_drops_old_orders_keeps_fresh(self):
+        now = time.time()
+        pending = {
+            "old": {"chat_id": 1, "data": {}, "ts": now - self.bot.PENDING_TTL_SEC - 10},
+            "fresh": {"chat_id": 2, "data": {}, "ts": now - 10},
+        }
+        self.bot.prune_pending(pending)
+        self.assertEqual(set(pending), {"fresh"})
 
 
 if __name__ == "__main__":
