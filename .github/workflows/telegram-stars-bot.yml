@@ -39,7 +39,7 @@ jobs:
         run: |
           git config user.name "telegram-stars-bot"
           git config user.email "actions@users.noreply.github.com"
-          git add state.json fulfilled.json
+          git add state.json fulfilled.json pending_orders.json
           if git diff --cached --quiet; then
             echo "Nothing to commit."
             exit 0
