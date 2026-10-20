@@ -32,17 +32,30 @@ buyer themselves — nobody running this project would know it happened.
 """
 import json
 import os
+import secrets
 import sys
 import time
 import urllib.error
 import urllib.request
 import urllib.parse
 
+from custom_invoice import parse_invoice_text, render_invoice, preview_text, USAGE
+
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 API = f"https://api.telegram.org/bot{TOKEN}"
 BASE_URL = "https://kleogeos.github.io/freelancer-tools"
 STATE_PATH = os.path.join(os.path.dirname(__file__), "state.json")
 FULFILLED_PATH = os.path.join(os.path.dirname(__file__), "fulfilled.json")
+PENDING_PATH = os.path.join(os.path.dirname(__file__), "pending_orders.json")
+
+# Custom-invoice-via-chat flow: same bot/token, new payload prefix
+# "custom-invoice:<order_id>". Priced like the cheapest existing product
+# (ru-kit is 530 stars) but lower, since there's no bundle of documents —
+# just one generated file, closer to an impulse buy than the Starter Kit.
+CUSTOM_INVOICE_STARS = 100
+# Abandoned previews (parsed but never paid) are pruned after this long —
+# no reason to keep a stranger's invoice data around indefinitely.
+PENDING_TTL_SEC = 48 * 60 * 60
 
 # invoice_payload -> (download path(s), display name)
 PRODUCTS = {
@@ -86,6 +99,45 @@ def api_call(method, **params):
     raise last_err
 
 
+def send_document(chat_id, filename, content_bytes, caption=None):
+    # sendDocument needs multipart/form-data, unlike every other call in this
+    # file (plain JSON) — built by hand rather than pulling in `requests`, to
+    # keep this bot's only dependency the Python standard library (same
+    # zero-deps rule as the rest of this project's tools). Mirrors api_call's
+    # retry loop rather than reusing it, since api_call is JSON-only and used
+    # by every other call site — not worth complicating its signature for
+    # this one multipart caller.
+    boundary = secrets.token_hex(16)
+    parts = []
+    parts.append(f"--{boundary}\r\nContent-Disposition: form-data; name=\"chat_id\"\r\n\r\n{chat_id}\r\n".encode())
+    if caption:
+        parts.append(
+            f"--{boundary}\r\nContent-Disposition: form-data; name=\"caption\"\r\n\r\n{caption}\r\n".encode()
+        )
+    parts.append(
+        (f"--{boundary}\r\nContent-Disposition: form-data; name=\"document\"; filename=\"{filename}\"\r\n"
+         f"Content-Type: text/html\r\n\r\n").encode()
+        + content_bytes
+        + b"\r\n"
+    )
+    parts.append(f"--{boundary}--\r\n".encode())
+    body = b"".join(parts)
+    req = urllib.request.Request(
+        f"{API}/sendDocument", data=body,
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+    )
+    last_err = None
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(req, timeout=40) as r:
+                return json.load(r)
+        except (urllib.error.URLError, TimeoutError) as e:
+            last_err = e
+            if attempt < 2:
+                time.sleep(1 + attempt)
+    raise last_err
+
+
 def notify_human(text):
     token = os.environ.get("TELEGRAM_NOTIFY_TOKEN")
     chat_id = os.environ.get("TELEGRAM_NOTIFY_CHAT_ID")
@@ -111,11 +163,64 @@ def save_json(path, obj):
         json.dump(obj, f, indent=2)
 
 
-def handle_pre_checkout(pcq):
+def prune_pending(pending):
+    now = time.time()
+    expired = [oid for oid, o in pending.items() if now - o.get("ts", 0) > PENDING_TTL_SEC]
+    for oid in expired:
+        del pending[oid]
+    return pending
+
+
+def handle_message(message, pending):
+    text = message.get("text")
+    if not text:
+        return  # photos/stickers/etc — nothing for this bot to act on
+    chat_id = message["chat"]["id"]
+    stripped = text.strip()
+    if stripped.lower() in ("/start", "/invoice"):
+        api_call("sendMessage", chat_id=chat_id, text=USAGE)
+        return
+    if not stripped.lower().startswith("/invoice"):
+        return  # don't reply to every message in a group this bot might be added to
+
+    data, err = parse_invoice_text(text)
+    if err:
+        api_call("sendMessage", chat_id=chat_id, text=err)
+        return
+
+    order_id = secrets.token_hex(4)
+    pending[order_id] = {"chat_id": chat_id, "data": data, "ts": time.time()}
+    resp = api_call(
+        "createInvoiceLink",
+        title="Custom Invoice",
+        description=f"Generated from your message — {data['from']} to {data['to']}",
+        payload=f"custom-invoice:{order_id}",
+        currency="XTR",
+        prices=[{"label": "Custom Invoice", "amount": CUSTOM_INVOICE_STARS}],
+    )
+    if not resp.get("ok"):
+        del pending[order_id]
+        api_call("sendMessage", chat_id=chat_id,
+                  text="Something went wrong generating your payment link — please try again.")
+        print(f"[WARN] createInvoiceLink failed: {resp}")
+        return
+    api_call(
+        "sendMessage",
+        chat_id=chat_id,
+        text=f"{preview_text(data)}\n\nPay to receive the polished HTML file:\n{resp['result']}",
+    )
+    print(f"[pending] order {order_id} -> chat {chat_id}")
+
+
+def handle_pre_checkout(pcq, pending):
     # Must answer within 10s. payload must be a known product, otherwise reject
     # so no one can be charged for a typo'd/unknown payload.
     payload = pcq.get("invoice_payload", "")
-    ok = payload in PRODUCTS or payload in TIPS
+    ok = (
+        payload in PRODUCTS
+        or payload in TIPS
+        or (payload.startswith("custom-invoice:") and payload.split(":", 1)[1] in pending)
+    )
     kwargs = {"pre_checkout_query_id": pcq["id"], "ok": ok}
     if not ok:
         kwargs["error_message"] = "Unknown product, please use the link from the website."
@@ -123,13 +228,37 @@ def handle_pre_checkout(pcq):
     print(f"[pre_checkout] payload={payload!r} ok={ok}")
 
 
-def handle_successful_payment(message, fulfilled):
+def handle_successful_payment(message, fulfilled, pending=None):
     sp = message["successful_payment"]
     charge_id = sp["telegram_payment_charge_id"]
     payload = sp.get("invoice_payload", "")
     chat_id = message["chat"]["id"]
     if charge_id in fulfilled:
         return  # already delivered, never double-send
+    if payload.startswith("custom-invoice:"):
+        order_id = payload.split(":", 1)[1]
+        order = (pending or {}).pop(order_id, None)
+        if order is None:
+            # Buyer was already charged by Telegram at this point. This can
+            # happen if pending_orders.json and the actual payment landed in
+            # different GitHub Actions job runs and the state file didn't
+            # carry the order over (same race class as fulfilled.json —
+            # documented there). Must notify, not drop silently.
+            print(f"[WARN] successful_payment for unknown custom-invoice order_id={order_id!r} charge_id={charge_id}")
+            notify_human(
+                f"URGENT: charged {sp['total_amount']} Stars for custom invoice "
+                f"order {order_id!r} (charge {charge_id[:12]}...) — buyer paid, "
+                f"no pending order data found, needs manual refund or fulfillment."
+            )
+            return
+        html_out = render_invoice(order["data"])
+        send_document(chat_id, "invoice.html", html_out.encode("utf-8"),
+                      caption="Thanks for your order! Here's your invoice.")
+        fulfilled[charge_id] = {"product": "Custom Invoice", "stars": sp["total_amount"]}
+        save_json(FULFILLED_PATH, fulfilled)
+        print(f"[fulfilled] custom-invoice {order_id} -> chat {chat_id} (charge {charge_id[:12]}...)")
+        notify_human(f"Sale! Custom Invoice ({sp['total_amount']} Stars, charge {charge_id[:12]}...)")
+        return
     if payload in TIPS:
         api_call(
             "sendMessage",
@@ -178,6 +307,7 @@ def main():
         )
     state = load_json(STATE_PATH, {"offset": 0})
     fulfilled = load_json(FULFILLED_PATH, {})
+    pending = prune_pending(load_json(PENDING_PATH, {}))
     deadline = time.time() + MAX_RUNTIME_SEC
 
     while time.time() < deadline:
@@ -187,9 +317,13 @@ def main():
             for update in resp.get("result", []):
                 state["offset"] = update["update_id"] + 1
                 if "pre_checkout_query" in update:
-                    handle_pre_checkout(update["pre_checkout_query"])
+                    handle_pre_checkout(update["pre_checkout_query"], pending)
                 elif "message" in update and "successful_payment" in update["message"]:
-                    handle_successful_payment(update["message"], fulfilled)
+                    handle_successful_payment(update["message"], fulfilled, pending)
+                    save_json(PENDING_PATH, pending)
+                elif "message" in update:
+                    handle_message(update["message"], pending)
+                    save_json(PENDING_PATH, pending)
             save_json(STATE_PATH, state)
         except (urllib.error.URLError, TimeoutError) as e:
             # Retries inside api_call already absorbed short blips; if we still
