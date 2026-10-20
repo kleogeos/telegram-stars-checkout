@@ -30,6 +30,7 @@ reusing that token here does not steal its updates) push a message to the
 human on every real sale/tip. Without this, a sale is only visible to the
 buyer themselves — nobody running this project would know it happened.
 """
+import http.client
 import json
 import os
 import secrets
@@ -92,7 +93,7 @@ def api_call(method, **params):
         try:
             with urllib.request.urlopen(req, timeout=40) as r:
                 return json.load(r)
-        except (urllib.error.URLError, TimeoutError) as e:
+        except (urllib.error.URLError, TimeoutError, http.client.HTTPException) as e:
             last_err = e
             if attempt < 2:
                 time.sleep(1 + attempt)
@@ -131,7 +132,7 @@ def send_document(chat_id, filename, content_bytes, caption=None):
         try:
             with urllib.request.urlopen(req, timeout=40) as r:
                 return json.load(r)
-        except (urllib.error.URLError, TimeoutError) as e:
+        except (urllib.error.URLError, TimeoutError, http.client.HTTPException) as e:
             last_err = e
             if attempt < 2:
                 time.sleep(1 + attempt)
@@ -325,7 +326,7 @@ def main():
                     handle_message(update["message"], pending)
                     save_json(PENDING_PATH, pending)
             save_json(STATE_PATH, state)
-        except (urllib.error.URLError, TimeoutError) as e:
+        except (urllib.error.URLError, TimeoutError, http.client.HTTPException) as e:
             # Retries inside api_call already absorbed short blips; if we still
             # land here the network is down for longer. Sleep and keep polling
             # within this same job instead of exiting and waiting hours for
