@@ -454,6 +454,167 @@ class TestCustomInvoiceFlow(unittest.TestCase):
         self.assertEqual(set(pending), {"fresh"})
 
 
+class TestSubscriptionFlow(unittest.TestCase):
+    """Recurring Stars subscription: /subscribe -> createInvoiceLink with
+    subscription_period -> successful_payment (first + renewal) -> /invoice
+    delivers free while active -> /status reports state -> /cancel stops
+    renewal without revoking the current period."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        os.environ["TELEGRAM_BOT_TOKEN"] = "test-token"
+        import bot
+        self.bot = bot
+        self.bot.STATE_PATH = os.path.join(self.tmpdir, "state.json")
+        self.bot.FULFILLED_PATH = os.path.join(self.tmpdir, "fulfilled.json")
+        self.bot.PENDING_PATH = os.path.join(self.tmpdir, "pending_orders.json")
+        self.bot.SUBSCRIBERS_PATH = os.path.join(self.tmpdir, "subscribers.json")
+        self.calls = []
+
+        def fake_api_call(method, **params):
+            self.calls.append((method, params))
+            if method == "createInvoiceLink":
+                return {"ok": True, "result": "https://t.me/invoice/subhash"}
+            return {"ok": True, "result": True}
+
+        self.api_patcher = mock.patch.object(self.bot, "api_call", fake_api_call)
+        self.api_patcher.start()
+        self.docs_sent = []
+        self.docs_patcher = mock.patch.object(
+            self.bot, "send_document",
+            side_effect=lambda chat_id, filename, content_bytes, caption=None:
+                self.docs_sent.append((chat_id, filename, content_bytes, caption)),
+        )
+        self.docs_patcher.start()
+
+    def tearDown(self):
+        self.api_patcher.stop()
+        self.docs_patcher.stop()
+
+    def test_subscribe_creates_invoice_link_with_subscription_period(self):
+        self.bot.handle_message({"chat": {"id": 1}, "text": "/subscribe"}, {}, {})
+        method, params = next(c for c in self.calls if c[0] == "createInvoiceLink")
+        self.assertEqual(params["currency"], "XTR")
+        self.assertEqual(params["subscription_period"], self.bot.SUBSCRIPTION_PERIOD_SEC)
+        self.assertEqual(len(params["prices"]), 1)
+        self.assertEqual(params["payload"], self.bot.SUBSCRIPTION_PAYLOAD)
+
+    def test_subscribe_when_already_active_does_not_create_new_link(self):
+        subscribers = {"1": {"user_id": 1, "charge_id": "c1", "expires": time.time() + 1000, "is_recurring": True}}
+        self.bot.handle_message({"chat": {"id": 1}, "text": "/subscribe"}, {}, subscribers)
+        self.assertFalse(any(c[0] == "createInvoiceLink" for c in self.calls))
+
+    def test_pre_checkout_accepts_subscription_payload(self):
+        self.bot.handle_pre_checkout({"id": "pcq1", "invoice_payload": "unlimited-invoices-sub"}, {})
+        method, params = self.calls[-1]
+        self.assertTrue(params["ok"])
+
+    def test_first_successful_payment_creates_subscriber_and_notifies_new(self):
+        fulfilled, subscribers = {}, {}
+        expires = time.time() + self.bot.SUBSCRIPTION_PERIOD_SEC
+        message = {
+            "chat": {"id": 5}, "from": {"id": 5},
+            "successful_payment": {
+                "telegram_payment_charge_id": "sub-ch1",
+                "invoice_payload": "unlimited-invoices-sub",
+                "total_amount": self.bot.SUBSCRIPTION_STARS,
+                "subscription_expiration_date": expires,
+                "is_first_recurring": True,
+            },
+        }
+        notified = []
+        with mock.patch.object(self.bot, "notify_human", side_effect=lambda t: notified.append(t)):
+            self.bot.handle_successful_payment(message, fulfilled, {}, subscribers)
+        self.assertIn("5", subscribers)
+        self.assertEqual(subscribers["5"]["expires"], expires)
+        self.assertIn("sub-ch1", fulfilled)
+        self.assertIn("New", notified[0])
+
+    def test_renewal_payment_extends_expiration_and_notifies_renewed(self):
+        fulfilled = {}
+        old_expires = time.time() + 100
+        subscribers = {"5": {"user_id": 5, "charge_id": "sub-ch1", "expires": old_expires, "is_recurring": True}}
+        new_expires = old_expires + self.bot.SUBSCRIPTION_PERIOD_SEC
+        message = {
+            "chat": {"id": 5}, "from": {"id": 5},
+            "successful_payment": {
+                "telegram_payment_charge_id": "sub-ch2",
+                "invoice_payload": "unlimited-invoices-sub",
+                "total_amount": self.bot.SUBSCRIPTION_STARS,
+                "subscription_expiration_date": new_expires,
+                "is_first_recurring": False,
+            },
+        }
+        notified = []
+        with mock.patch.object(self.bot, "notify_human", side_effect=lambda t: notified.append(t)):
+            self.bot.handle_successful_payment(message, fulfilled, {}, subscribers)
+        self.assertEqual(subscribers["5"]["expires"], new_expires)
+        self.assertIn("Renewed", notified[0])
+
+    def test_replayed_update_for_same_period_is_not_double_processed(self):
+        fulfilled = {}
+        expires = time.time() + self.bot.SUBSCRIPTION_PERIOD_SEC
+        subscribers = {"5": {"user_id": 5, "charge_id": "sub-ch1", "expires": expires, "is_recurring": True}}
+        message = {
+            "chat": {"id": 5}, "from": {"id": 5},
+            "successful_payment": {
+                "telegram_payment_charge_id": "sub-ch1",
+                "invoice_payload": "unlimited-invoices-sub",
+                "total_amount": self.bot.SUBSCRIPTION_STARS,
+                "subscription_expiration_date": expires,
+                "is_first_recurring": True,
+            },
+        }
+        before = len(self.calls)
+        self.bot.handle_successful_payment(message, fulfilled, {}, subscribers)
+        self.assertEqual(len(self.calls), before)  # no sendMessage fired again
+
+    def test_active_subscriber_gets_invoice_for_free_no_payment_link(self):
+        subscribers = {"7": {"user_id": 7, "charge_id": "c1", "expires": time.time() + 1000, "is_recurring": True}}
+        text = "/invoice\nfrom: Jane\nto: Acme\nitem: Design | 1 | 100"
+        self.bot.handle_message({"chat": {"id": 7}, "text": text}, {}, subscribers)
+        self.assertEqual(len(self.docs_sent), 1)
+        self.assertFalse(any(c[0] == "createInvoiceLink" for c in self.calls))
+
+    def test_non_subscriber_still_gets_payment_link_for_invoice(self):
+        text = "/invoice\nfrom: Jane\nto: Acme\nitem: Design | 1 | 100"
+        pending = {}
+        self.bot.handle_message({"chat": {"id": 8}, "text": text}, pending, {})
+        self.assertEqual(self.docs_sent, [])
+        self.assertTrue(any(c[0] == "createInvoiceLink" for c in self.calls))
+        self.assertEqual(len(pending), 1)
+
+    def test_status_reports_active_and_inactive(self):
+        subscribers = {"1": {"user_id": 1, "charge_id": "c1", "expires": time.time() + 1000, "is_recurring": True}}
+        self.bot.handle_message({"chat": {"id": 1}, "text": "/status"}, {}, subscribers)
+        self.assertIn("Active subscription", self.calls[-1][1]["text"])
+
+        self.bot.handle_message({"chat": {"id": 2}, "text": "/status"}, {}, {})
+        self.assertIn("No active subscription", self.calls[-1][1]["text"])
+
+    def test_cancel_calls_edit_user_star_subscription_and_keeps_access(self):
+        expires = time.time() + 1000
+        subscribers = {"3": {"user_id": 3, "charge_id": "c1", "expires": expires, "is_recurring": True}}
+        self.bot.handle_message({"chat": {"id": 3}, "text": "/cancel"}, {}, subscribers)
+        method, params = next(c for c in self.calls if c[0] == "editUserStarSubscription")
+        self.assertEqual(params["user_id"], 3)
+        self.assertEqual(params["telegram_payment_charge_id"], "c1")
+        self.assertTrue(params["is_canceled"])
+        self.assertFalse(subscribers["3"]["is_recurring"])
+        self.assertEqual(subscribers["3"]["expires"], expires)  # current period untouched
+
+    def test_cancel_with_no_subscription_does_not_call_api(self):
+        self.bot.handle_message({"chat": {"id": 9}, "text": "/cancel"}, {}, {})
+        self.assertFalse(any(c[0] == "editUserStarSubscription" for c in self.calls))
+
+    def test_is_active_subscriber_checks_expiry_not_recurring_flag(self):
+        subs = {"1": {"expires": time.time() + 10, "is_recurring": False}}
+        self.assertTrue(self.bot.is_active_subscriber(subs, 1))
+        subs2 = {"1": {"expires": time.time() - 10, "is_recurring": True}}
+        self.assertFalse(self.bot.is_active_subscriber(subs2, 1))
+        self.assertFalse(self.bot.is_active_subscriber({}, 999))
+
+
 if __name__ == "__main__":
     unittest.main()
 

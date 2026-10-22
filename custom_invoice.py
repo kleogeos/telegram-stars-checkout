@@ -83,7 +83,10 @@ item: Logo design | 1 | 200
 - "item" lines: description | quantity | rate (one per line, at least one required)
 - from/to are required. invoice_number/date/due_date/tax_rate/notes are optional.
 - You'll get a priced preview and a payment link first — the polished HTML file
-  is only generated and sent after payment (100 Stars, about $1.3)."""
+  is only generated and sent after payment (100 Stars, about $1.3).
+- Sending a lot of invoices? /subscribe for unlimited invoices at 250 Stars/month
+  (about $3.25) instead of paying per file. /status checks your subscription,
+  /cancel stops renewal (you keep access until the paid period ends)."""
 
 
 def parse_invoice_text(text):

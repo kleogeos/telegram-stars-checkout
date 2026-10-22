@@ -48,6 +48,7 @@ BASE_URL = "https://kleogeos.github.io/freelancer-tools"
 STATE_PATH = os.path.join(os.path.dirname(__file__), "state.json")
 FULFILLED_PATH = os.path.join(os.path.dirname(__file__), "fulfilled.json")
 PENDING_PATH = os.path.join(os.path.dirname(__file__), "pending_orders.json")
+SUBSCRIBERS_PATH = os.path.join(os.path.dirname(__file__), "subscribers.json")
 
 # Custom-invoice-via-chat flow: same bot/token, new payload prefix
 # "custom-invoice:<order_id>". Priced like the cheapest existing product
@@ -57,6 +58,16 @@ CUSTOM_INVOICE_STARS = 100
 # Abandoned previews (parsed but never paid) are pruned after this long —
 # no reason to keep a stranger's invoice data around indefinitely.
 PENDING_TTL_SEC = 48 * 60 * 60
+
+# Recurring subscription: unlimited /invoice generations instead of paying
+# CUSTOM_INVOICE_STARS per file. Priced so ~3 invoices/month breaks even for
+# the buyer (250 vs 300 Stars one-off) — a genuine discount for repeat use,
+# not just a different wrapper on the same price.
+SUBSCRIPTION_STARS = 250
+SUBSCRIPTION_PAYLOAD = "unlimited-invoices-sub"
+# Telegram requires this exact value (30 days in seconds) for Stars
+# subscriptions as of Bot API 7.x/8.0 — no other period is accepted.
+SUBSCRIPTION_PERIOD_SEC = 2592000
 
 # invoice_payload -> (download path(s), display name)
 PRODUCTS = {
@@ -172,12 +183,87 @@ def prune_pending(pending):
     return pending
 
 
-def handle_message(message, pending):
+def is_active_subscriber(subscribers, chat_id):
+    # A canceled subscription (is_recurring set False by /cancel) still paid
+    # for its current 30-day period — access lasts until "expires", renewal
+    # just won't fire again. Only "expires" gates access, never the
+    # recurring flag.
+    sub = subscribers.get(str(chat_id))
+    if not sub:
+        return False
+    return sub.get("expires", 0) > time.time()
+
+
+def handle_message(message, pending, subscribers=None):
+    subscribers = subscribers if subscribers is not None else {}
     text = message.get("text")
     if not text:
         return  # photos/stickers/etc — nothing for this bot to act on
     chat_id = message["chat"]["id"]
     stripped = text.strip()
+
+    if stripped.lower() == "/subscribe":
+        if is_active_subscriber(subscribers, chat_id):
+            api_call("sendMessage", chat_id=chat_id,
+                      text="You already have an active subscription — just send /invoice any time.")
+            return
+        resp = api_call(
+            "createInvoiceLink",
+            title="Unlimited Invoices — 30 days",
+            description="Unlimited /invoice generations for 30 days, auto-renews in Stars.",
+            payload=SUBSCRIPTION_PAYLOAD,
+            currency="XTR",
+            subscription_period=SUBSCRIPTION_PERIOD_SEC,
+            prices=[{"label": "Unlimited Invoices (30 days)", "amount": SUBSCRIPTION_STARS}],
+        )
+        if not resp.get("ok"):
+            api_call("sendMessage", chat_id=chat_id,
+                      text="Something went wrong generating your subscription link — please try again.")
+            print(f"[WARN] createInvoiceLink (subscription) failed: {resp}")
+            return
+        api_call(
+            "sendMessage",
+            chat_id=chat_id,
+            text=(f"Unlimited custom invoices for {SUBSCRIPTION_STARS} Stars/month "
+                  f"(vs {CUSTOM_INVOICE_STARS} Stars per invoice one-off):\n{resp['result']}\n\n"
+                  "Cancel any time with /cancel — you keep access until the period you paid for ends."),
+        )
+        return
+
+    if stripped.lower() == "/status":
+        if is_active_subscriber(subscribers, chat_id):
+            sub = subscribers[str(chat_id)]
+            until = time.strftime("%Y-%m-%d", time.gmtime(sub["expires"]))
+            renew = "renews automatically" if sub.get("is_recurring") else "will NOT renew (canceled)"
+            api_call("sendMessage", chat_id=chat_id,
+                      text=f"Active subscription, {renew}, current period until {until}.")
+        else:
+            api_call("sendMessage", chat_id=chat_id,
+                      text="No active subscription. /subscribe for unlimited invoices, or /invoice to pay per file.")
+        return
+
+    if stripped.lower() == "/cancel":
+        sub = subscribers.get(str(chat_id))
+        if not sub or not is_active_subscriber(subscribers, chat_id):
+            api_call("sendMessage", chat_id=chat_id, text="No active subscription to cancel.")
+            return
+        resp = api_call(
+            "editUserStarSubscription",
+            user_id=sub["user_id"],
+            telegram_payment_charge_id=sub["charge_id"],
+            is_canceled=True,
+        )
+        if resp.get("ok"):
+            sub["is_recurring"] = False
+            until = time.strftime("%Y-%m-%d", time.gmtime(sub["expires"]))
+            api_call("sendMessage", chat_id=chat_id,
+                      text=f"Subscription canceled — you keep access until {until}, then it won't renew.")
+        else:
+            api_call("sendMessage", chat_id=chat_id,
+                      text="Couldn't cancel right now — please try again.")
+            print(f"[WARN] editUserStarSubscription failed: {resp}")
+        return
+
     if stripped.lower() in ("/start", "/invoice"):
         api_call("sendMessage", chat_id=chat_id, text=USAGE)
         return
@@ -187,6 +273,13 @@ def handle_message(message, pending):
     data, err = parse_invoice_text(text)
     if err:
         api_call("sendMessage", chat_id=chat_id, text=err)
+        return
+
+    if is_active_subscriber(subscribers, chat_id):
+        html_out = render_invoice(data)
+        send_document(chat_id, "invoice.html", html_out.encode("utf-8"),
+                      caption="Here's your invoice (included in your subscription).")
+        print(f"[fulfilled] subscriber invoice -> chat {chat_id}")
         return
 
     order_id = secrets.token_hex(4)
@@ -208,7 +301,8 @@ def handle_message(message, pending):
     api_call(
         "sendMessage",
         chat_id=chat_id,
-        text=f"{preview_text(data)}\n\nPay to receive the polished HTML file:\n{resp['result']}",
+        text=(f"{preview_text(data)}\n\nPay to receive the polished HTML file:\n{resp['result']}\n\n"
+              f"Tip: /subscribe for unlimited invoices at {SUBSCRIPTION_STARS} Stars/month."),
     )
     print(f"[pending] order {order_id} -> chat {chat_id}")
 
@@ -220,6 +314,7 @@ def handle_pre_checkout(pcq, pending):
     ok = (
         payload in PRODUCTS
         or payload in TIPS
+        or payload == SUBSCRIPTION_PAYLOAD
         or (payload.startswith("custom-invoice:") and payload.split(":", 1)[1] in pending)
     )
     kwargs = {"pre_checkout_query_id": pcq["id"], "ok": ok}
@@ -229,11 +324,45 @@ def handle_pre_checkout(pcq, pending):
     print(f"[pre_checkout] payload={payload!r} ok={ok}")
 
 
-def handle_successful_payment(message, fulfilled, pending=None):
+def handle_successful_payment(message, fulfilled, pending=None, subscribers=None):
     sp = message["successful_payment"]
     charge_id = sp["telegram_payment_charge_id"]
     payload = sp.get("invoice_payload", "")
     chat_id = message["chat"]["id"]
+    if payload == SUBSCRIPTION_PAYLOAD:
+        subscribers = subscribers if subscribers is not None else {}
+        # Renewals reuse the SAME payload and fire a new successful_payment
+        # every ~30 days with a new charge_id — charge_id dedup (used for
+        # one-off products below) would wrongly treat every renewal after
+        # the first as "already delivered". Dedup on expiration date instead:
+        # if we already recorded this exact period, it's a replayed update.
+        existing = subscribers.get(str(chat_id))
+        if existing and existing.get("expires") == sp.get("subscription_expiration_date"):
+            return  # already processed this billing period
+        is_first = sp.get("is_first_recurring", existing is None)
+        user_id = message.get("from", {}).get("id", chat_id)
+        subscribers[str(chat_id)] = {
+            "user_id": user_id,
+            "charge_id": charge_id,
+            "expires": sp.get("subscription_expiration_date"),
+            "is_recurring": True,
+        }
+        save_json(SUBSCRIBERS_PATH, subscribers)
+        fulfilled[charge_id] = {"product": "Unlimited Invoices Subscription", "stars": sp["total_amount"]}
+        save_json(FULFILLED_PATH, fulfilled)
+        api_call(
+            "sendMessage", chat_id=chat_id,
+            text=("Subscribed! Send /invoice any time this month for a free generated file. "
+                  "/status to check your period, /cancel to stop renewal.")
+            if is_first else
+            "Subscription renewed for another 30 days. Thanks for sticking around!",
+        )
+        print(f"[fulfilled] subscription {'new' if is_first else 'renewal'} -> chat {chat_id} (charge {charge_id[:12]}...)")
+        notify_human(
+            f"{'New' if is_first else 'Renewed'} subscription! {sp['total_amount']} Stars/mo "
+            f"(charge {charge_id[:12]}...)"
+        )
+        return
     if charge_id in fulfilled:
         return  # already delivered, never double-send
     if payload.startswith("custom-invoice:"):
@@ -309,6 +438,7 @@ def main():
     state = load_json(STATE_PATH, {"offset": 0})
     fulfilled = load_json(FULFILLED_PATH, {})
     pending = prune_pending(load_json(PENDING_PATH, {}))
+    subscribers = load_json(SUBSCRIBERS_PATH, {})
     deadline = time.time() + MAX_RUNTIME_SEC
 
     while time.time() < deadline:
@@ -320,10 +450,10 @@ def main():
                 if "pre_checkout_query" in update:
                     handle_pre_checkout(update["pre_checkout_query"], pending)
                 elif "message" in update and "successful_payment" in update["message"]:
-                    handle_successful_payment(update["message"], fulfilled, pending)
+                    handle_successful_payment(update["message"], fulfilled, pending, subscribers)
                     save_json(PENDING_PATH, pending)
                 elif "message" in update:
-                    handle_message(update["message"], pending)
+                    handle_message(update["message"], pending, subscribers)
                     save_json(PENDING_PATH, pending)
             save_json(STATE_PATH, state)
         except (urllib.error.URLError, TimeoutError, http.client.HTTPException) as e:

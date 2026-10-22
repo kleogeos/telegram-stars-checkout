@@ -20,6 +20,31 @@ same output to people who aren't. See `custom_invoice.py` for parsing/
 rendering (deliberately duplicated from `freelance-invoice-cli/invoice.py`
 rather than imported across repos — keep in sync by hand if that changes).
 
+## Unlimited invoices subscription (new, 22.10)
+
+`/subscribe` creates a recurring Stars subscription (250/month, ~$3.25) via
+`createInvoiceLink` with `subscription_period=2592000` — Telegram requires
+exactly 30 days in seconds, no other value is accepted for Stars
+subscriptions, and `prices` must contain exactly one item. On payment,
+the chat is recorded in `subscribers.json` with its
+`subscription_expiration_date`; while that date is in the future, every
+`/invoice` the subscriber sends is rendered and delivered immediately with
+no per-file charge, instead of generating a one-off pay link. `/status`
+reports the current period and renewal state; `/cancel` calls
+`editUserStarSubscription(is_canceled=True)` — this stops future renewal
+but does **not** revoke the period already paid for (Telegram's documented
+behavior: access continues until `subscription_expiration_date`, only the
+next auto-renewal charge is skipped). Renewal payments reuse the same
+`invoice_payload` and arrive as a new `successful_payment` roughly every 30
+days (`is_first_recurring=False`); these are deduped by comparing the new
+`subscription_expiration_date` against the stored one, not by charge ID
+(unlike every other product here), since a legitimate renewal always gets
+a fresh charge ID.
+
+This is the project's first recurring-revenue product — every other
+checkout in this portfolio (including the other products in this same
+bot) is a one-off payment, donation, or affiliate commission.
+
 ## Why this exists
 
 Telegram requires `answerPreCheckoutQuery` within 10 seconds of every payment attempt, for any currency including Stars — there's no auto-approve. This repo runs that responder inside a scheduled GitHub Actions job: public-repo Actions minutes are unlimited, so a ~5h50m long-poll per run, re-triggered by cron every 6 hours, gives near-continuous coverage for $0 and no extra hosting account.
@@ -31,7 +56,7 @@ Telegram requires `answerPreCheckoutQuery` within 10 seconds of every payment at
 - `.github/workflows/telegram-stars-bot.yml` — the scheduled runner (schedule trigger disabled until activation, see comment in the file).
 - `.github/workflows/test.yml` — runs `test_bot.py` on every push.
 - `create_invoice_links.py` — generates the 5 checkout links (starter-kit, prompt-pack, dev-pack, bundle, ru-kit). Star prices use the ~$0.013/star rate Telegram actually credits sellers.
-- `state.json` / `fulfilled.json` — persisted between runs so restarts don't reprocess old updates or double-deliver.
+- `state.json` / `fulfilled.json` / `pending_orders.json` / `subscribers.json` — persisted between runs so restarts don't reprocess old updates, double-deliver, lose an in-flight custom-invoice preview, or forget who's an active subscriber.
 
 ## Adding a new product
 
