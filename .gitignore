@@ -3,3 +3,6 @@ __pycache__/
 .pytest_cache/
 .venv/
 invoice_links.json
+fulfilled.json
+pending_orders.json
+subscribers.json

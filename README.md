@@ -56,7 +56,7 @@ Telegram requires `answerPreCheckoutQuery` within 10 seconds of every payment at
 - `.github/workflows/telegram-stars-bot.yml` — the scheduled runner (schedule trigger disabled until activation, see comment in the file).
 - `.github/workflows/test.yml` — runs `test_bot.py` on every push.
 - `create_invoice_links.py` — generates the 5 checkout links (starter-kit, prompt-pack, dev-pack, bundle, ru-kit). Star prices use the ~$0.013/star rate Telegram actually credits sellers.
-- `state.json` / `fulfilled.json` / `pending_orders.json` / `subscribers.json` — persisted between runs so restarts don't reprocess old updates, double-deliver, lose an in-flight custom-invoice preview, or forget who's an active subscriber.
+- `state.json` — last processed update ID. `fulfilled.json`, `pending_orders.json`, and `subscribers.json` are created only inside the runner. The workflow encrypts them before committing `*.json.enc` to the public repository. This preserves paid subscriptions and pending invoices across scheduled runs without publishing customer data. The existing bot token in GitHub Secrets is the encryption passphrase; rotating it requires re-encrypting these files first.
 
 ## Adding a new product
 

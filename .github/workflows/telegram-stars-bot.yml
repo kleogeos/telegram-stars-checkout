@@ -7,11 +7,11 @@ name: Telegram Stars checkout responder
 # the Midas human-notification bot, since two consumers polling the same
 # bot's getUpdates would steal each other's updates.
 #
-# The `schedule` trigger below is ACTIVE: TELEGRAM_BOT_TOKEN was set and
-# this has been running since 17.10. Each run's ~5h50m long-poll plus the
-# serializing concurrency group means a new cron tick just queues behind
-# the still-running job and starts right after it finishes — that queue
-# wait (up to ~6h) is expected, not a stuck run.
+# The `schedule` trigger is intentionally commented out until the secret
+# exists: cron would otherwise fire every 6h forever and fail every time
+# (no token yet), leaving this public repo with a permanently red Actions
+# tab. Uncomment it as the last step of activation, after TELEGRAM_BOT_TOKEN
+# is set.
 on:
   schedule:
     - cron: "0 */6 * * *"
@@ -28,6 +28,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # The repository is public. Keep invoice details and subscriber payment
+      # identifiers encrypted at rest, using the bot token already in Secrets.
+      - name: Restore encrypted customer state
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        run: |
+          set -euo pipefail
+          for file in fulfilled.json pending_orders.json subscribers.json; do
+            if [[ -f "$file.enc" ]]; then
+              openssl enc -d -aes-256-cbc -pbkdf2 -iter 100000 \
+                -pass env:TELEGRAM_BOT_TOKEN -in "$file.enc" -out "$file"
+            fi
+          done
+
       - name: Run responder
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -35,11 +49,26 @@ jobs:
           TELEGRAM_NOTIFY_CHAT_ID: ${{ secrets.TELEGRAM_NOTIFY_CHAT_ID }}
         run: python3 bot.py
 
+      - name: Persist encrypted customer state
+        if: always()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        run: |
+          set -euo pipefail
+          for file in fulfilled.json pending_orders.json subscribers.json; do
+            if [[ -f "$file" ]]; then
+              openssl enc -e -aes-256-cbc -pbkdf2 -iter 100000 -salt \
+                -pass env:TELEGRAM_BOT_TOKEN -in "$file" -out "$file.enc"
+              rm "$file"
+            fi
+          done
+
       - name: Commit updated state
+        if: always()
         run: |
           git config user.name "telegram-stars-bot"
           git config user.email "actions@users.noreply.github.com"
-          git add state.json fulfilled.json pending_orders.json subscribers.json
+          git add state.json fulfilled.json.enc pending_orders.json.enc subscribers.json.enc
           if git diff --cached --quiet; then
             echo "Nothing to commit."
             exit 0

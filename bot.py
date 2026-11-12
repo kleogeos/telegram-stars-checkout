@@ -20,9 +20,8 @@ polling getUpdates on a token already being read by another consumer would
 steal that consumer's updates. Set TELEGRAM_BOT_TOKEN as a repo secret.
 
 State: last processed update_id is persisted to state.json and committed
-back so a restart doesn't reprocess old updates. Fulfilled payments are
-logged to fulfilled.json (charge_id -> product) so a replayed update never
-double-delivers.
+back so a restart doesn't reprocess old updates. Payment and invoice state
+is encrypted by the workflow before it is committed to this public repo.
 
 Optional repo secrets TELEGRAM_NOTIFY_TOKEN/TELEGRAM_NOTIFY_CHAT_ID (the
 Midas human-notification bot — sendMessage only, no getUpdates polling, so
@@ -255,6 +254,7 @@ def handle_message(message, pending, subscribers=None):
         )
         if resp.get("ok"):
             sub["is_recurring"] = False
+            save_json(SUBSCRIBERS_PATH, subscribers)
             until = time.strftime("%Y-%m-%d", time.gmtime(sub["expires"]))
             api_call("sendMessage", chat_id=chat_id,
                       text=f"Subscription canceled — you keep access until {until}, then it won't renew.")
