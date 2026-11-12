@@ -56,6 +56,9 @@ jobs:
         run: |
           set -euo pipefail
           for file in fulfilled.json pending_orders.json subscribers.json; do
+            if [[ ! -f "$file" && ! -f "$file.enc" ]]; then
+              printf '{}\n' > "$file"
+            fi
             if [[ -f "$file" ]]; then
               openssl enc -e -aes-256-cbc -pbkdf2 -iter 100000 -salt \
                 -pass env:TELEGRAM_BOT_TOKEN -in "$file" -out "$file.enc"
