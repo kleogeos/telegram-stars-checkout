@@ -21,12 +21,23 @@ concurrency:
   group: telegram-stars-bot
   cancel-in-progress: false
 
+# The responder commits encrypted customer state after each polling window.
+# GitHub's default GITHUB_TOKEN permission may be read-only, which lets the
+# responder serve updates but makes its final git push fail (exit 128).
+permissions:
+  contents: write
+
 jobs:
   respond:
     runs-on: ubuntu-latest
     timeout-minutes: 355
     steps:
+      # A scheduled run can wait behind the previous long-poll job for hours.
+      # Its event SHA is then stale because that job committed new state.
+      # Check out the current main when this job actually starts.
       - uses: actions/checkout@v4
+        with:
+          ref: main
 
       # The repository is public. Keep invoice details and subscriber payment
       # identifiers encrypted at rest, using the bot token already in Secrets.
