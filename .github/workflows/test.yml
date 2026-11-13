@@ -6,7 +6,9 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # Python 3.9 is not available to setup-python on Ubuntu 26.04, which
+    # ubuntu-latest moved to in November 2026. Keep this matrix on 24.04.
+    runs-on: ubuntu-24.04
     strategy:
       matrix:
         python-version: ["3.9", "3.10", "3.11", "3.12"]
